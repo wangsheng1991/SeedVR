@@ -1,0 +1,642 @@
+# // Copyright (c) 2025 Custom Training Implementation
+# //
+# // Licensed under the Apache License, Version 2.0 (the "License")
+
+"""
+VideoDiffusionTrainer - Core training class for SeedVR2 APT training
+
+Implements:
+- Adversarial Post-Training (APT) for one-step video super-resolution
+- FSDP distributed training
+- EMA model updates
+- Gradient checkpointing
+- Mixed precision training
+"""
+
+import os
+import gc
+import datetime
+from typing import Dict, Optional, Tuple, List, Any
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
+from einops import rearrange
+from omegaconf import DictConfig, OmegaConf
+
+from common.config import create_object, load_config
+from common.distributed import get_device, get_global_rank, get_world_size, init_torch
+from common.distributed.advanced import (
+    init_sequence_parallel,
+    init_model_shard_group,
+    get_data_parallel_rank,
+    get_sequence_parallel_world_size,
+)
+from common.seed import set_seed
+from common.logger import get_logger
+
+from models.discriminator import PatchDiscriminator3D, VideoDiscriminator
+from losses.apt_loss import SeedVR2Loss
+from data.video_pair_dataset import create_dataloader
+
+
+class EMAModel:
+    """Exponential Moving Average for model parameters"""
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.data
+
+    def apply_shadow(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
+    def state_dict(self):
+        return self.shadow
+
+    def load_state_dict(self, state_dict):
+        self.shadow = state_dict
+
+
+class VideoDiffusionTrainer:
+    """
+    Main trainer class for SeedVR2 APT training
+
+    Args:
+        config: OmegaConf configuration
+    """
+    def __init__(self, config: DictConfig):
+        self.config = config
+        self.logger = get_logger()
+        self.device = get_device()
+        self.global_step = 0
+        self.epoch = 0
+
+        # Will be initialized in configure_*
+        self.dit = None
+        self.vae = None
+        self.discriminator = None
+        self.ema = None
+
+        self.optimizer_g = None
+        self.optimizer_d = None
+        self.scheduler_g = None
+        self.scheduler_d = None
+
+        self.loss_fn = None
+        self.scaler = None
+
+    def configure_dit_model(self, checkpoint: Optional[str] = None):
+        """Initialize DiT (generator) model"""
+        self.logger.info("Configuring DiT model...")
+
+        # Create model
+        self.dit = create_object(self.config.dit.model)
+
+        # Load checkpoint if provided
+        if checkpoint:
+            state = torch.load(checkpoint, map_location="cpu", mmap=True)
+            self.dit.load_state_dict(state, strict=True)
+            self.logger.info(f"Loaded DiT checkpoint from {checkpoint}")
+
+        # Enable gradient checkpointing
+        if self.config.dit.get("gradient_checkpoint", True):
+            self.dit.set_gradient_checkpointing(True)
+
+        self.dit.to(self.device)
+
+        # Print model size
+        num_params = sum(p.numel() for p in self.dit.parameters())
+        trainable_params = sum(p.numel() for p in self.dit.parameters() if p.requires_grad)
+        self.logger.info(f"DiT parameters: {num_params:,} (trainable: {trainable_params:,})")
+
+    def configure_vae_model(self):
+        """Initialize VAE model (frozen)"""
+        self.logger.info("Configuring VAE model...")
+
+        dtype = getattr(torch, self.config.vae.get("dtype", "bfloat16"))
+        self.vae = create_object(self.config.vae.model)
+        self.vae.requires_grad_(False).eval()
+        self.vae.to(device=self.device, dtype=dtype)
+
+        # Load checkpoint
+        if self.config.vae.get("checkpoint"):
+            state = torch.load(self.config.vae.checkpoint, map_location=self.device, mmap=True)
+            self.vae.load_state_dict(state)
+            self.logger.info(f"Loaded VAE checkpoint from {self.config.vae.checkpoint}")
+
+        # Set causal slicing for memory efficiency
+        if hasattr(self.vae, "set_causal_slicing") and hasattr(self.config.vae, "slicing"):
+            self.vae.set_causal_slicing(**self.config.vae.slicing)
+
+        if hasattr(self.vae, "set_memory_limit") and hasattr(self.config.vae, "memory_limit"):
+            self.vae.set_memory_limit(**self.config.vae.memory_limit)
+
+    def configure_discriminator(self):
+        """Initialize discriminator for APT"""
+        self.logger.info("Configuring Discriminator...")
+
+        disc_config = self.config.get("discriminator", {})
+        disc_type = disc_config.get("type", "patch")
+
+        if disc_type == "patch":
+            self.discriminator = PatchDiscriminator3D(
+                in_channels=disc_config.get("in_channels", 3),
+                base_channels=disc_config.get("base_channels", 64),
+                num_layers=disc_config.get("num_layers", 3),
+                use_spectral_norm=disc_config.get("use_spectral_norm", True),
+            )
+        else:
+            self.discriminator = VideoDiscriminator(
+                in_channels=disc_config.get("in_channels", 3),
+                base_channels=disc_config.get("base_channels", 64),
+                max_channels=disc_config.get("max_channels", 512),
+                num_layers=disc_config.get("num_layers", 4),
+            )
+
+        self.discriminator.to(self.device)
+
+        num_params = sum(p.numel() for p in self.discriminator.parameters())
+        self.logger.info(f"Discriminator parameters: {num_params:,}")
+
+    def configure_ema(self):
+        """Initialize EMA for generator"""
+        if self.config.get("ema", {}).get("decay", 0) > 0:
+            decay = self.config.ema.decay
+            self.ema = EMAModel(self.dit, decay=decay)
+            self.logger.info(f"Initialized EMA with decay={decay}")
+
+    def configure_optimizers(self):
+        """Initialize optimizers and schedulers"""
+        opt_config = self.config.get("optimizer", {})
+
+        # Generator optimizer
+        g_lr = opt_config.get("g_lr", 1e-5)
+        g_betas = tuple(opt_config.get("g_betas", [0.0, 0.99]))
+        g_weight_decay = opt_config.get("g_weight_decay", 0.0)
+
+        self.optimizer_g = torch.optim.AdamW(
+            self.dit.parameters(),
+            lr=g_lr,
+            betas=g_betas,
+            weight_decay=g_weight_decay,
+        )
+
+        # Discriminator optimizer
+        d_lr = opt_config.get("d_lr", 1e-4)
+        d_betas = tuple(opt_config.get("d_betas", [0.0, 0.99]))
+        d_weight_decay = opt_config.get("d_weight_decay", 0.0)
+
+        self.optimizer_d = torch.optim.AdamW(
+            self.discriminator.parameters(),
+            lr=d_lr,
+            betas=d_betas,
+            weight_decay=d_weight_decay,
+        )
+
+        self.logger.info(f"Generator optimizer: AdamW lr={g_lr}")
+        self.logger.info(f"Discriminator optimizer: AdamW lr={d_lr}")
+
+        # Optional: learning rate schedulers
+        scheduler_config = self.config.get("scheduler", {})
+        if scheduler_config.get("type") == "cosine":
+            total_steps = scheduler_config.get("total_steps", 100000)
+            warmup_steps = scheduler_config.get("warmup_steps", 1000)
+
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    return step / warmup_steps
+                progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+
+            self.scheduler_g = torch.optim.lr_scheduler.LambdaLR(self.optimizer_g, lr_lambda)
+            self.scheduler_d = torch.optim.lr_scheduler.LambdaLR(self.optimizer_d, lr_lambda)
+
+    def configure_loss(self):
+        """Initialize loss functions"""
+        loss_config = self.config.get("loss", {})
+
+        self.loss_fn = SeedVR2Loss(
+            lambda_adv=loss_config.get("lambda_adv", 1.0),
+            lambda_fm=loss_config.get("lambda_fm", 10.0),
+            lambda_r1=loss_config.get("lambda_r1", 10.0),
+            lambda_recon=loss_config.get("lambda_recon", 0.0),
+            lambda_lpips=loss_config.get("lambda_lpips", 0.0),
+            loss_type=loss_config.get("type", "nonsaturating"),
+        )
+
+        self.logger.info(f"Loss configured: lambda_adv={loss_config.get('lambda_adv', 1.0)}, "
+                        f"lambda_fm={loss_config.get('lambda_fm', 10.0)}, "
+                        f"lambda_r1={loss_config.get('lambda_r1', 10.0)}")
+
+    def configure_amp(self):
+        """Configure automatic mixed precision"""
+        if self.config.get("training", {}).get("use_amp", True):
+            self.scaler = GradScaler()
+            self.logger.info("Enabled automatic mixed precision (AMP)")
+
+    def configure_all(
+        self,
+        dit_checkpoint: Optional[str] = None,
+        sp_size: int = 1,
+    ):
+        """Configure all components"""
+        # Initialize distributed
+        init_torch(cudnn_benchmark=True, timeout=datetime.timedelta(seconds=3600))
+
+        if sp_size > 1:
+            init_sequence_parallel(sp_size)
+
+        # Initialize FSDP if configured
+        if self.config.dit.get("fsdp"):
+            sharding_strategy = getattr(
+                ShardingStrategy,
+                self.config.dit.fsdp.get("sharding_strategy", "FULL_SHARD")
+            )
+            init_model_shard_group(sharding_strategy=sharding_strategy)
+
+        # Configure components
+        self.configure_dit_model(checkpoint=dit_checkpoint)
+        self.configure_vae_model()
+        self.configure_discriminator()
+        self.configure_ema()
+        self.configure_optimizers()
+        self.configure_loss()
+        self.configure_amp()
+
+    @torch.no_grad()
+    def vae_encode(self, videos: torch.Tensor) -> torch.Tensor:
+        """Encode videos to latent space"""
+        dtype = getattr(torch, self.config.vae.get("dtype", "bfloat16"))
+        scale = self.config.vae.get("scaling_factor", 0.9152)
+
+        videos = videos.to(self.device, dtype)
+
+        # VAE encode
+        if hasattr(self.vae, "preprocess"):
+            videos = self.vae.preprocess(videos)
+
+        latent = self.vae.encode(videos).latent
+        latent = latent.unsqueeze(2) if latent.ndim == 4 else latent
+        latent = rearrange(latent, "b c ... -> b ... c")
+        latent = latent * scale
+
+        return latent
+
+    @torch.no_grad()
+    def vae_decode(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode latents to pixel space"""
+        dtype = getattr(torch, self.config.vae.get("dtype", "bfloat16"))
+        scale = self.config.vae.get("scaling_factor", 0.9152)
+
+        latents = latents.to(self.device, dtype)
+        latents = latents / scale
+        latents = rearrange(latents, "b ... c -> b c ...")
+        latents = latents.squeeze(2) if latents.shape[2] == 1 else latents
+
+        samples = self.vae.decode(latents).sample
+
+        if hasattr(self.vae, "postprocess"):
+            samples = self.vae.postprocess(samples)
+
+        return samples
+
+    def get_condition(self, latent_lq: torch.Tensor) -> torch.Tensor:
+        """Build condition tensor from LQ latent"""
+        # SeedVR format: concatenate LQ latent with mask channel
+        t, h, w, c = latent_lq.shape[-4:]
+        cond = torch.zeros([*latent_lq.shape[:-1], c + 1], device=latent_lq.device, dtype=latent_lq.dtype)
+        cond[..., :-1] = latent_lq
+        cond[..., -1:] = 1.0  # Mask indicating condition
+        return cond
+
+    def generator_forward(
+        self,
+        lq_latent: torch.Tensor,
+        text_embeds: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Generator forward pass (one-step generation)
+
+        Args:
+            lq_latent: Low-quality latent (B, T, H, W, C)
+            text_embeds: Text embeddings dict
+
+        Returns:
+            Generated HQ latent
+        """
+        batch_size = lq_latent.shape[0]
+
+        # Prepare noise (for one-step, we start from pure noise at t=T)
+        noise = torch.randn_like(lq_latent)
+
+        # Build condition
+        condition = self.get_condition(lq_latent)
+
+        # Concatenate noise with condition
+        dit_input = torch.cat([noise, condition], dim=-1)
+
+        # For one-step generation, use t=0 (or very small t)
+        # This means we predict the clean sample directly
+        timestep = torch.zeros(batch_size, device=self.device)
+
+        # DiT forward
+        with autocast("cuda", torch.bfloat16, enabled=self.scaler is not None):
+            output = self.dit(
+                vid=dit_input,
+                txt=text_embeds.get("texts_pos", []),
+                vid_shape=torch.tensor(lq_latent.shape[1:4], device=self.device).unsqueeze(0).repeat(batch_size, 1),
+                txt_shape=text_embeds.get("txt_shape", []),
+                timestep=timestep,
+            )
+
+        return output.vid_sample
+
+    def train_step_discriminator(
+        self,
+        hq_video: torch.Tensor,
+        fake_video: torch.Tensor,
+        apply_r1: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Train discriminator for one step
+
+        Args:
+            hq_video: Real HQ video (B, C, T, H, W)
+            fake_video: Generated video (B, C, T, H, W)
+            apply_r1: Whether to apply R1 regularization
+
+        Returns:
+            Loss dictionary
+        """
+        self.optimizer_d.zero_grad()
+
+        # Prepare real input (need gradients for R1)
+        if apply_r1:
+            hq_video = hq_video.detach().requires_grad_(True)
+
+        # Forward pass
+        with autocast("cuda", torch.bfloat16, enabled=self.scaler is not None):
+            real_pred, real_features = self.discriminator(hq_video, return_features=True)
+            fake_pred, _ = self.discriminator(fake_video.detach(), return_features=False)
+
+            # Compute discriminator loss
+            d_loss, d_loss_dict = self.loss_fn.compute_discriminator_loss(
+                real_pred=real_pred,
+                fake_pred=fake_pred,
+                real_images=hq_video if apply_r1 else None,
+                apply_r1=apply_r1,
+            )
+
+        # Backward
+        if self.scaler is not None:
+            self.scaler.scale(d_loss).backward()
+            self.scaler.step(self.optimizer_d)
+            self.scaler.update()
+        else:
+            d_loss.backward()
+            self.optimizer_d.step()
+
+        return d_loss_dict
+
+    def train_step_generator(
+        self,
+        lq_latent: torch.Tensor,
+        hq_video: torch.Tensor,
+        text_embeds: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Train generator for one step
+
+        Args:
+            lq_latent: LQ latent from VAE
+            hq_video: Real HQ video for feature matching
+            text_embeds: Text embeddings
+
+        Returns:
+            fake_video: Generated video
+            loss_dict: Loss dictionary
+        """
+        self.optimizer_g.zero_grad()
+
+        # Generate fake
+        with autocast("cuda", torch.bfloat16, enabled=self.scaler is not None):
+            fake_latent = self.generator_forward(lq_latent, text_embeds)
+
+        # Decode to pixel space
+        fake_video = self.vae_decode(fake_latent)
+
+        # Discriminator forward (for generator loss)
+        with autocast("cuda", torch.bfloat16, enabled=self.scaler is not None):
+            # Get real features (no grad needed, just for matching)
+            with torch.no_grad():
+                _, real_features = self.discriminator(hq_video, return_features=True)
+
+            # Get fake prediction and features
+            fake_pred, fake_features = self.discriminator(fake_video, return_features=True)
+
+            # Compute generator loss
+            g_loss, g_loss_dict = self.loss_fn.compute_generator_loss(
+                fake_pred=fake_pred,
+                real_features=real_features,
+                fake_features=fake_features,
+                fake_images=fake_video,
+                real_images=hq_video,
+            )
+
+        # Backward
+        if self.scaler is not None:
+            self.scaler.scale(g_loss).backward()
+            self.scaler.step(self.optimizer_g)
+            self.scaler.update()
+        else:
+            g_loss.backward()
+            self.optimizer_g.step()
+
+        return fake_video, g_loss_dict
+
+    def train_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        text_embeds: Dict[str, torch.Tensor],
+    ) -> Dict[str, float]:
+        """
+        Complete training step (D + G)
+
+        Args:
+            batch: Data batch with 'lq' and 'hq' keys
+            text_embeds: Text embeddings
+
+        Returns:
+            Combined loss dictionary
+        """
+        lq_video = batch['lq'].to(self.device)  # (B, T, C, H, W)
+        hq_video = batch['hq'].to(self.device)  # (B, T, C, H, W)
+
+        # Convert to (B, C, T, H, W) format
+        lq_video = rearrange(lq_video, 'b t c h w -> b c t h w')
+        hq_video = rearrange(hq_video, 'b t c h w -> b c t h w')
+
+        # VAE encode LQ
+        with torch.no_grad():
+            lq_latent = self.vae_encode(lq_video)
+
+        # Apply R1 every N steps
+        r1_interval = self.config.get("loss", {}).get("r1_interval", 16)
+        apply_r1 = (self.global_step % r1_interval == 0)
+
+        # Train generator
+        fake_video, g_loss_dict = self.train_step_generator(
+            lq_latent=lq_latent,
+            hq_video=hq_video,
+            text_embeds=text_embeds,
+        )
+
+        # Train discriminator
+        d_loss_dict = self.train_step_discriminator(
+            hq_video=hq_video,
+            fake_video=fake_video,
+            apply_r1=apply_r1,
+        )
+
+        # Update EMA
+        if self.ema is not None:
+            self.ema.update(self.dit)
+
+        # Update schedulers
+        if self.scheduler_g is not None:
+            self.scheduler_g.step()
+        if self.scheduler_d is not None:
+            self.scheduler_d.step()
+
+        self.global_step += 1
+
+        # Combine loss dicts
+        loss_dict = {**g_loss_dict, **d_loss_dict}
+        loss_dict['step'] = self.global_step
+
+        return loss_dict
+
+    def save_checkpoint(self, path: str):
+        """Save training checkpoint"""
+        if get_global_rank() != 0:
+            return
+
+        checkpoint = {
+            'global_step': self.global_step,
+            'epoch': self.epoch,
+            'dit_state_dict': self.dit.state_dict(),
+            'discriminator_state_dict': self.discriminator.state_dict(),
+            'optimizer_g_state_dict': self.optimizer_g.state_dict(),
+            'optimizer_d_state_dict': self.optimizer_d.state_dict(),
+        }
+
+        if self.ema is not None:
+            checkpoint['ema_state_dict'] = self.ema.state_dict()
+
+        if self.scheduler_g is not None:
+            checkpoint['scheduler_g_state_dict'] = self.scheduler_g.state_dict()
+            checkpoint['scheduler_d_state_dict'] = self.scheduler_d.state_dict()
+
+        torch.save(checkpoint, path)
+        self.logger.info(f"Saved checkpoint to {path}")
+
+    def load_checkpoint(self, path: str):
+        """Load training checkpoint"""
+        checkpoint = torch.load(path, map_location=self.device)
+
+        self.global_step = checkpoint['global_step']
+        self.epoch = checkpoint['epoch']
+
+        self.dit.load_state_dict(checkpoint['dit_state_dict'])
+        self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+        self.optimizer_g.load_state_dict(checkpoint['optimizer_g_state_dict'])
+        self.optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
+
+        if self.ema is not None and 'ema_state_dict' in checkpoint:
+            self.ema.load_state_dict(checkpoint['ema_state_dict'])
+
+        if self.scheduler_g is not None and 'scheduler_g_state_dict' in checkpoint:
+            self.scheduler_g.load_state_dict(checkpoint['scheduler_g_state_dict'])
+            self.scheduler_d.load_state_dict(checkpoint['scheduler_d_state_dict'])
+
+        self.logger.info(f"Loaded checkpoint from {path} at step {self.global_step}")
+
+    def train(
+        self,
+        dataloader,
+        text_embeds: Dict[str, torch.Tensor],
+        num_epochs: int = 100,
+        log_interval: int = 100,
+        save_interval: int = 1000,
+        save_dir: str = "./checkpoints",
+    ):
+        """
+        Main training loop
+
+        Args:
+            dataloader: Training data loader
+            text_embeds: Pre-computed text embeddings
+            num_epochs: Number of epochs
+            log_interval: Steps between logging
+            save_interval: Steps between checkpoints
+            save_dir: Directory for checkpoints
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        self.dit.train()
+        self.discriminator.train()
+
+        for epoch in range(self.epoch, num_epochs):
+            self.epoch = epoch
+
+            if hasattr(dataloader.sampler, 'set_epoch'):
+                dataloader.sampler.set_epoch(epoch)
+
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=get_global_rank() != 0)
+
+            for batch in pbar:
+                loss_dict = self.train_step(batch, text_embeds)
+
+                # Logging
+                if self.global_step % log_interval == 0 and get_global_rank() == 0:
+                    log_str = f"Step {self.global_step}: "
+                    log_str += ", ".join([f"{k}={v:.4f}" for k, v in loss_dict.items() if k != 'step'])
+                    self.logger.info(log_str)
+                    pbar.set_postfix(loss_dict)
+
+                # Save checkpoint
+                if self.global_step % save_interval == 0:
+                    ckpt_path = os.path.join(save_dir, f"checkpoint_{self.global_step}.pth")
+                    self.save_checkpoint(ckpt_path)
+
+                # Memory cleanup
+                if self.global_step % 100 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+        # Final checkpoint
+        self.save_checkpoint(os.path.join(save_dir, "checkpoint_final.pth"))

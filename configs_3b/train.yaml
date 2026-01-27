@@ -1,0 +1,61 @@
+# Training configuration for SeedVR2 APT
+# Inherits from main.yaml and adds training-specific settings
+
+__inherit__: configs_3b/main.yaml
+
+# Override to use trainer
+__object__:
+  path: projects.video_diffusion_sr.train
+  name: VideoDiffusionTrainer
+
+# Discriminator configuration
+discriminator:
+  type: patch  # 'patch' or 'video'
+  in_channels: 3
+  base_channels: 64
+  num_layers: 3
+  use_spectral_norm: true
+
+# Optimizer configuration
+optimizer:
+  # Generator
+  g_lr: 1.0e-5
+  g_betas: [0.0, 0.99]
+  g_weight_decay: 0.0
+  # Discriminator
+  d_lr: 1.0e-4
+  d_betas: [0.0, 0.99]
+  d_weight_decay: 0.0
+
+# Learning rate scheduler
+scheduler:
+  type: cosine
+  total_steps: 100000
+  warmup_steps: 1000
+
+# Loss configuration
+loss:
+  type: nonsaturating  # 'nonsaturating' or 'hinge'
+  lambda_adv: 1.0
+  lambda_fm: 10.0
+  lambda_r1: 10.0
+  lambda_recon: 0.0  # Set > 0 for reconstruction loss
+  lambda_lpips: 0.0  # Set > 0 for perceptual loss
+  r1_interval: 16    # Apply R1 every N steps
+
+# EMA configuration
+ema:
+  decay: 0.9999
+
+# Training configuration
+training:
+  use_amp: true
+  gradient_clip: 1.0
+
+# Data configuration (can be overridden by command line)
+data:
+  num_frames: 16
+  frame_interval: 1
+  crop_size: [256, 256]
+  scale_factor: 4
+  augment: true
