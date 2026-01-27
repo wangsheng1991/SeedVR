@@ -52,6 +52,8 @@
 
 # SeedVR2: One-Step Video Restoration via Diffusion Adversarial Post-Training
 > [Jianyi Wang](https://iceclear.github.io), [Shanchuan Lin](https://scholar.google.com/citations?user=EDWUw7gAAAAJ&hl=en), [Zhijie Lin](https://scholar.google.com/citations?user=xXMj6_EAAAAJ&hl=en), [Yuxi Ren](https://scholar.google.com.hk/citations?user=C_6JH-IAAAAJ&hl=en), [Meng Wei](https://openreview.net/profile?id=~Meng_Wei11), [Zongsheng Yue](https://zsyoaoa.github.io/), [Shangchen Zhou](https://shangchenzhou.com/), [Hao Chen](https://haochen-rye.github.io/), [Yang Zhao](https://scholar.google.com/citations?user=uPmTOHAAAAAJ&hl=en), [Ceyuan Yang](https://ceyuan.me/), [Xuefeng Xiao](https://scholar.google.com/citations?user=CVkM9TQAAAAJ&hl=en), [Chen Change Loy](https://www.mmlab-ntu.com/person/ccloy/index.html), [Lu Jiang](http://www.lujiang.info/)
+> 
+> **ICLR 2026**
 
 <p>
   <a href="https://iceclear.github.io/projects/seedvr2/">
@@ -102,7 +104,14 @@
 
 We sincerely thank all contributors from the open community for their valuable support.
 
-- **June 22, 2025:** Huge thanks [NumZ](https://github.com/numz) for building the [ComfyUI](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler) [![GitHub Stars](https://img.shields.io/github/stars/numz/ComfyUI-SeedVR2_VideoUpscaler?style=social)](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler)!
+- **Jan. 27, 2026:** SeedVR2 is accepted by ICLR2026.
+- **June 22, 2025:** Huge thank [NumZ](https://github.com/numz), [adrientoupet](https://github.com/adrientoupet) as well as the [great community](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/discussions) for building the [ComfyUI](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler) [![GitHub Stars](https://img.shields.io/github/stars/numz/ComfyUI-SeedVR2_VideoUpscaler?style=social)](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler)!
+<div align="center">
+  <a href="https://youtu.be/MBtWYXq_r60">
+    <img src="https://img.youtube.com/vi/MBtWYXq_r60/maxresdefault.jpg" width="50%" alt="SeedVR2 v2.5 Deep Dive Tutorial">
+  </a>
+</div>
+
 - **June 11, 2025:** Repo created.
 
 
@@ -170,11 +179,11 @@ torchrun --nproc-per-node=NUM_GPUS projects/inference_seedvr2_3b.py --video_path
 ## ✍️ Citation
 
 ```bibtex
-@article{wang2025seedvr2,
+@inproceedings{wang2025seedvr2,
       title={SeedVR2: One-Step Video Restoration via Diffusion Adversarial Post-Training},
       author={Wang, Jianyi and Lin, Shanchuan and Lin, Zhijie and Ren, Yuxi and Wei, Meng and Yue, Zongsheng and Zhou, Shangchen and Chen, Hao and Zhao, Yang and Yang, Ceyuan and Xiao, Xuefeng and Loy, Chen Change and Jiang, Lu},
-      booktitle={arXiv preprint arXiv:2506.05301},
-      year={2025}
+      booktitle={ICLR},
+      year={2026}
    }
 
 @inproceedings{wang2025seedvr,
