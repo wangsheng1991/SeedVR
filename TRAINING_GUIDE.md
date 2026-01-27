@@ -1,5 +1,8 @@
 # SeedVR2 APT Training Guide
 
+> **Status**: ✅ All core tests passed - Ready for GPU testing
+> See [TEST_RESULTS.md](TEST_RESULTS.md) for detailed test results
+
 ## 新增文件结构
 
 ```
