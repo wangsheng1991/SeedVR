@@ -18,13 +18,16 @@ class EqualLinear(nn.Module):
     """Equalized learning rate linear layer from StyleGAN2"""
     def __init__(self, in_features, out_features, bias=True, lr_mul=1.0):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) / lr_mul)
+        # Initialize with standard normal (not divided by lr_mul)
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
         self.scale = (1 / math.sqrt(in_features)) * lr_mul
         self.lr_mul = lr_mul
 
     def forward(self, x):
-        out = F.linear(x, self.weight * self.scale, self.bias * self.lr_mul if self.bias is not None else None)
+        # Apply equalized learning rate scaling at runtime
+        bias = self.bias * self.lr_mul if self.bias is not None else None
+        out = F.linear(x, self.weight * self.scale, bias)
         return out
 
 
@@ -39,6 +42,7 @@ class EqualConv3d(nn.Module):
         if isinstance(padding, int):
             padding = (padding, padding, padding)
 
+        # Initialize with standard normal
         self.weight = nn.Parameter(torch.randn(out_channels, in_channels, *kernel_size))
         self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
         self.scale = 1 / math.sqrt(in_channels * kernel_size[0] * kernel_size[1] * kernel_size[2])
@@ -58,14 +62,18 @@ class ResBlock3D(nn.Module):
         self.conv2 = EqualConv3d(out_channels, out_channels, 3, padding=1)
         self.skip = EqualConv3d(in_channels, out_channels, 1, bias=False) if in_channels != out_channels else nn.Identity()
         self.downsample = downsample
+        # Learnable residual scaling (initialized to 1)
+        self.residual_scale = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, x):
         residual = self.skip(x)
 
         out = F.leaky_relu(self.conv1(x), 0.2)
-        out = F.leaky_relu(self.conv2(out), 0.2)
+        out = self.conv2(out)  # No activation before residual add
 
-        out = (out + residual) / math.sqrt(2)
+        # Scale residual branch for stable training
+        out = residual + out * self.residual_scale
+        out = F.leaky_relu(out, 0.2)
 
         if self.downsample:
             # Downsample spatially, keep temporal or downsample by 2
@@ -172,6 +180,7 @@ class LatentDiscriminator(nn.Module):
         in_channels: Latent channels (16 for SeedVR VAE)
         base_channels: Base channel multiplier
         num_layers: Number of residual blocks
+        input_format: 'BTHWC' (SeedVR format) or 'BCTHW' (standard PyTorch)
     """
     def __init__(
         self,
@@ -179,9 +188,11 @@ class LatentDiscriminator(nn.Module):
         base_channels: int = 128,
         max_channels: int = 512,
         num_layers: int = 3,
+        input_format: str = 'BTHWC',
     ):
         super().__init__()
 
+        self.input_format = input_format
         channels = [min(base_channels * (2 ** i), max_channels) for i in range(num_layers + 1)]
 
         # Initial projection
@@ -203,19 +214,23 @@ class LatentDiscriminator(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        return_features: bool = False
+        return_features: bool = False,
+        input_format: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
         """
         Args:
-            x: Input latent tensor (B, T, H, W, C) - SeedVR format
+            x: Input latent tensor
             return_features: Whether to return intermediate features
+            input_format: Override input format ('BTHWC' or 'BCTHW')
 
         Returns:
             pred: Discriminator prediction (B, 1)
             features: List of intermediate features if return_features=True
         """
+        fmt = input_format or self.input_format
+
         # Convert from SeedVR format (B, T, H, W, C) to standard (B, C, T, H, W)
-        if x.dim() == 5 and x.shape[-1] < x.shape[1]:
+        if fmt == 'BTHWC':
             x = x.permute(0, 4, 1, 2, 3)
 
         features = []

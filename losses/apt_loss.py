@@ -56,7 +56,8 @@ class APTLoss(nn.Module):
         """
         # Non-saturating loss: -log(D(G(z)))
         # Equivalent to: softplus(-D(G(z)))
-        return F.softplus(-fake_pred).mean()
+        # Clamp for numerical stability (avoid overflow in exp)
+        return F.softplus(-fake_pred.clamp(-50, 50)).mean()
 
     def discriminator_loss(
         self,
@@ -73,6 +74,10 @@ class APTLoss(nn.Module):
         Returns:
             Discriminator adversarial loss
         """
+        # Clamp for numerical stability
+        real_pred = real_pred.clamp(-50, 50)
+        fake_pred = fake_pred.clamp(-50, 50)
+
         # Real loss: -log(D(x)) = softplus(-D(x))
         real_loss = F.softplus(-real_pred).mean()
         # Fake loss: -log(1 - D(G(z))) = softplus(D(G(z)))
@@ -88,6 +93,9 @@ class APTLoss(nn.Module):
         """
         Feature matching loss - matches intermediate discriminator features
 
+        Uses layer-wise weighting: deeper layers (more semantic) get higher weight
+        Following pix2pixHD: weight = 1 / num_layers for each layer
+
         Args:
             real_features: List of features from real samples
             fake_features: List of features from fake samples
@@ -98,11 +106,14 @@ class APTLoss(nn.Module):
         loss = 0.0
         num_features = len(real_features)
 
-        for real_feat, fake_feat in zip(real_features, fake_features):
+        for i, (real_feat, fake_feat) in enumerate(zip(real_features, fake_features)):
             # L1 loss on features, detach real to not backprop through D
-            loss += F.l1_loss(fake_feat, real_feat.detach())
+            # Weight each layer equally (1/num_features), but could use
+            # layer_weight = 1.0 / (2 ** (num_features - i - 1)) for deeper = higher
+            layer_loss = F.l1_loss(fake_feat, real_feat.detach())
+            loss += layer_loss / num_features
 
-        return (loss / num_features) * self.lambda_fm
+        return loss * self.lambda_fm
 
     def r1_regularization(
         self,

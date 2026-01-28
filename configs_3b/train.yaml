@@ -8,6 +8,12 @@ __object__:
   path: projects.video_diffusion_sr.train
   name: VideoDiffusionTrainer
 
+# Diffusion schedule configuration
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+
 # Discriminator configuration
 discriminator:
   type: patch  # 'patch' or 'video'
@@ -41,7 +47,7 @@ loss:
   lambda_r1: 10.0
   lambda_recon: 0.0  # Set > 0 for reconstruction loss
   lambda_lpips: 0.0  # Set > 0 for perceptual loss
-  r1_interval: 16    # Apply R1 every N steps
+  r1_interval: 16    # Apply R1 every N steps (lazy regularization)
 
 # EMA configuration
 ema:
@@ -51,6 +57,7 @@ ema:
 training:
   use_amp: true
   gradient_clip: 1.0
+  gc_interval: 1000  # Memory cleanup interval
 
 # Data configuration (can be overridden by command line)
 data:

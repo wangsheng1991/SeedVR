@@ -113,7 +113,50 @@ class VideoDiffusionTrainer:
         self.scheduler_d = None
 
         self.loss_fn = None
-        self.scaler = None
+        self.scaler_g = None
+        self.scaler_d = None
+
+        # Diffusion schedule parameters
+        self.num_timesteps = config.get("diffusion", {}).get("num_timesteps", 1000)
+        self.beta_start = config.get("diffusion", {}).get("beta_start", 0.0001)
+        self.beta_end = config.get("diffusion", {}).get("beta_end", 0.02)
+        self._setup_diffusion_schedule()
+
+    def _setup_diffusion_schedule(self):
+        """Setup diffusion noise schedule (linear beta schedule)"""
+        betas = torch.linspace(self.beta_start, self.beta_end, self.num_timesteps)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+        # Store as buffers (will be moved to device when needed)
+        self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+
+        self.logger.info(f"Diffusion schedule: {self.num_timesteps} timesteps, "
+                        f"beta [{self.beta_start}, {self.beta_end}]")
+
+    def _add_noise(self, x: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        """
+        Add noise to clean samples according to diffusion schedule
+
+        Args:
+            x: Clean samples (B, ...)
+            noise: Gaussian noise (B, ...)
+            timestep: Timestep indices (B,)
+
+        Returns:
+            Noisy samples at timestep t
+        """
+        # Move schedule to device if needed
+        sqrt_alpha = self.sqrt_alphas_cumprod.to(x.device)[timestep]
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod.to(x.device)[timestep]
+
+        # Reshape for broadcasting
+        while sqrt_alpha.dim() < x.dim():
+            sqrt_alpha = sqrt_alpha.unsqueeze(-1)
+            sqrt_one_minus_alpha = sqrt_one_minus_alpha.unsqueeze(-1)
+
+        return sqrt_alpha * x + sqrt_one_minus_alpha * noise
 
     def configure_dit_model(self, checkpoint: Optional[str] = None):
         """Initialize DiT (generator) model"""
@@ -184,6 +227,16 @@ class VideoDiffusionTrainer:
             )
 
         self.discriminator.to(self.device)
+
+        # Wrap with DDP for distributed training
+        import torch.distributed as dist
+        if dist.is_initialized() and get_world_size() > 1:
+            self.discriminator = DDP(
+                self.discriminator,
+                device_ids=[self.device] if self.device.type == 'cuda' else None,
+                find_unused_parameters=False,
+            )
+            self.logger.info("Discriminator wrapped with DDP")
 
         num_params = sum(p.numel() for p in self.discriminator.parameters())
         self.logger.info(f"Discriminator parameters: {num_params:,}")
@@ -352,41 +405,59 @@ class VideoDiffusionTrainer:
     def generator_forward(
         self,
         lq_latent: torch.Tensor,
+        hq_latent: torch.Tensor,
         text_embeds: Dict[str, torch.Tensor],
+        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Generator forward pass (one-step generation)
+        Generator forward pass for APT training
+
+        For APT (Adversarial Post-Training), we train the model to denoise
+        from a high timestep (near pure noise) to clean samples in one step.
 
         Args:
-            lq_latent: Low-quality latent (B, T, H, W, C)
+            lq_latent: Low-quality latent (B, T, H, W, C) - used as condition
+            hq_latent: High-quality latent (B, T, H, W, C) - used to construct noisy input
             text_embeds: Text embeddings dict
+            timestep: Optional timestep, if None uses max timestep for one-step generation
 
         Returns:
-            Generated HQ latent
+            Generated HQ latent (denoised prediction)
         """
         batch_size = lq_latent.shape[0]
 
-        # Prepare noise (for one-step, we start from pure noise at t=T)
-        noise = torch.randn_like(lq_latent)
+        # For APT one-step generation, use high timestep (near T_max)
+        # This means we start from heavily noised samples
+        if timestep is None:
+            # Use timestep near the end of diffusion (e.g., 999 for 1000 steps)
+            # For true one-step, use T_max - 1
+            t_value = self.num_timesteps - 1
+            timestep = torch.full((batch_size,), t_value, device=self.device, dtype=torch.long)
 
-        # Build condition
+        # Generate noise
+        noise = torch.randn_like(hq_latent)
+
+        # Create noisy HQ latent: x_t = sqrt(alpha_t) * x_0 + sqrt(1-alpha_t) * noise
+        noisy_hq = self._add_noise(hq_latent, noise, timestep)
+
+        # Build condition from LQ
         condition = self.get_condition(lq_latent)
 
-        # Concatenate noise with condition
-        dit_input = torch.cat([noise, condition], dim=-1)
+        # Concatenate noisy HQ with condition
+        # Input format: [noisy_sample, condition]
+        dit_input = torch.cat([noisy_hq, condition], dim=-1)
 
-        # For one-step generation, use t=0 (or very small t)
-        # This means we predict the clean sample directly
-        timestep = torch.zeros(batch_size, device=self.device)
+        # Convert timestep to float for model input
+        timestep_float = timestep.float()
 
-        # DiT forward
+        # DiT forward - predicts clean sample (or noise, depending on model)
         with autocast("cuda", torch.bfloat16, enabled=self.scaler_g is not None):
             output = self.dit(
                 vid=dit_input,
                 txt=text_embeds.get("texts_pos", []),
                 vid_shape=torch.tensor(lq_latent.shape[1:4], device=self.device).unsqueeze(0).repeat(batch_size, 1),
                 txt_shape=text_embeds.get("txt_shape", []),
-                timestep=timestep,
+                timestep=timestep_float,
             )
 
         return output.vid_sample
@@ -429,12 +500,17 @@ class VideoDiffusionTrainer:
         total_loss = d_adv
 
         # R1 regularization - compute outside autocast for numerical stability
+        # Apply lazy regularization scaling: multiply by r1_interval to compensate
+        # for only applying R1 every r1_interval steps
         if apply_r1 and hq_video is not None:
+            r1_interval = self.config.get("loss", {}).get("r1_interval", 16)
             # Need to exit autocast for gradient computation
             real_pred_float = real_pred.float()
             d_r1 = self.loss_fn.apt_loss.r1_regularization(real_pred_float, hq_video)
-            d_loss_dict['d_r1'] = d_r1.item()
-            total_loss = total_loss + d_r1
+            # Scale by r1_interval for lazy regularization (StyleGAN2 technique)
+            d_r1_scaled = d_r1 * r1_interval
+            d_loss_dict['d_r1'] = d_r1.item()  # Log unscaled for interpretability
+            total_loss = total_loss + d_r1_scaled
 
         d_loss_dict['d_total'] = total_loss.item()
 
@@ -457,6 +533,7 @@ class VideoDiffusionTrainer:
     def train_step_generator(
         self,
         lq_latent: torch.Tensor,
+        hq_latent: torch.Tensor,
         hq_video: torch.Tensor,
         text_embeds: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -465,6 +542,7 @@ class VideoDiffusionTrainer:
 
         Args:
             lq_latent: LQ latent from VAE
+            hq_latent: HQ latent from VAE (for constructing noisy input)
             hq_video: Real HQ video for feature matching
             text_embeds: Text embeddings
 
@@ -474,12 +552,13 @@ class VideoDiffusionTrainer:
         """
         self.optimizer_g.zero_grad()
 
-        # Generate fake
+        # Generate fake - now requires hq_latent for proper noise construction
         with autocast("cuda", torch.bfloat16, enabled=self.scaler_g is not None):
-            fake_latent = self.generator_forward(lq_latent, text_embeds)
+            fake_latent = self.generator_forward(lq_latent, hq_latent, text_embeds)
 
-        # Decode to pixel space
-        fake_video = self.vae_decode(fake_latent)
+        # Decode to pixel space (with no_grad since VAE is frozen)
+        with torch.no_grad():
+            fake_video = self.vae_decode(fake_latent)
 
         # Discriminator forward (for generator loss)
         with autocast("cuda", torch.bfloat16, enabled=self.scaler_g is not None):
@@ -540,11 +619,12 @@ class VideoDiffusionTrainer:
         lq_video = rearrange(lq_video, 'b t c h w -> b c t h w')
         hq_video = rearrange(hq_video, 'b t c h w -> b c t h w')
 
-        # VAE encode LQ
+        # VAE encode both LQ and HQ
         with torch.no_grad():
             lq_latent = self.vae_encode(lq_video)
+            hq_latent = self.vae_encode(hq_video)
 
-        # Apply R1 every N steps
+        # Apply R1 every N steps (with lazy regularization scaling)
         r1_interval = self.config.get("loss", {}).get("r1_interval", 16)
         apply_r1 = (self.global_step % r1_interval == 0)
 
@@ -552,7 +632,7 @@ class VideoDiffusionTrainer:
         # Generate fake video (no grad for D step)
         with torch.no_grad():
             with autocast("cuda", torch.bfloat16, enabled=self.scaler_g is not None):
-                fake_latent = self.generator_forward(lq_latent, text_embeds)
+                fake_latent = self.generator_forward(lq_latent, hq_latent, text_embeds)
             fake_video_for_d = self.vae_decode(fake_latent)
 
         d_loss_dict = self.train_step_discriminator(
@@ -564,13 +644,15 @@ class VideoDiffusionTrainer:
         # ============ Step 2: Train Generator ============
         fake_video, g_loss_dict = self.train_step_generator(
             lq_latent=lq_latent,
+            hq_latent=hq_latent,
             hq_video=hq_video,
             text_embeds=text_embeds,
         )
 
-        # Update EMA
+        # Update EMA (only on rank 0 for consistency in distributed training)
         if self.ema is not None:
-            self.ema.update(self.dit)
+            if get_global_rank() == 0 or get_world_size() == 1:
+                self.ema.update(self.dit)
 
         # Update schedulers
         if self.scheduler_g is not None:
@@ -591,11 +673,14 @@ class VideoDiffusionTrainer:
         if get_global_rank() != 0:
             return
 
+        # Handle DDP wrapped discriminator
+        disc_state = self.discriminator.module.state_dict() if hasattr(self.discriminator, 'module') else self.discriminator.state_dict()
+
         checkpoint = {
             'global_step': self.global_step,
             'epoch': self.epoch,
             'dit_state_dict': self.dit.state_dict(),
-            'discriminator_state_dict': self.discriminator.state_dict(),
+            'discriminator_state_dict': disc_state,
             'optimizer_g_state_dict': self.optimizer_g.state_dict(),
             'optimizer_d_state_dict': self.optimizer_d.state_dict(),
         }
@@ -606,6 +691,11 @@ class VideoDiffusionTrainer:
         if self.scheduler_g is not None:
             checkpoint['scheduler_g_state_dict'] = self.scheduler_g.state_dict()
             checkpoint['scheduler_d_state_dict'] = self.scheduler_d.state_dict()
+
+        # Save GradScaler states for proper AMP resume
+        if self.scaler_g is not None:
+            checkpoint['scaler_g_state_dict'] = self.scaler_g.state_dict()
+            checkpoint['scaler_d_state_dict'] = self.scaler_d.state_dict()
 
         torch.save(checkpoint, path)
         self.logger.info(f"Saved checkpoint to {path}")
@@ -618,16 +708,27 @@ class VideoDiffusionTrainer:
         self.epoch = checkpoint['epoch']
 
         self.dit.load_state_dict(checkpoint['dit_state_dict'])
-        self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+
+        # Handle DDP wrapped discriminator
+        if hasattr(self.discriminator, 'module'):
+            self.discriminator.module.load_state_dict(checkpoint['discriminator_state_dict'])
+        else:
+            self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+
         self.optimizer_g.load_state_dict(checkpoint['optimizer_g_state_dict'])
         self.optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
 
         if self.ema is not None and 'ema_state_dict' in checkpoint:
-            self.ema.load_state_dict(checkpoint['ema_state_dict'])
+            self.ema.load_state_dict(checkpoint['ema_state_dict'], device=self.device)
 
         if self.scheduler_g is not None and 'scheduler_g_state_dict' in checkpoint:
             self.scheduler_g.load_state_dict(checkpoint['scheduler_g_state_dict'])
             self.scheduler_d.load_state_dict(checkpoint['scheduler_d_state_dict'])
+
+        # Load GradScaler states
+        if self.scaler_g is not None and 'scaler_g_state_dict' in checkpoint:
+            self.scaler_g.load_state_dict(checkpoint['scaler_g_state_dict'])
+            self.scaler_d.load_state_dict(checkpoint['scaler_d_state_dict'])
 
         self.logger.info(f"Loaded checkpoint from {path} at step {self.global_step}")
 
@@ -679,10 +780,12 @@ class VideoDiffusionTrainer:
                     ckpt_path = os.path.join(save_dir, f"checkpoint_{self.global_step}.pth")
                     self.save_checkpoint(ckpt_path)
 
-                # Memory cleanup
-                if self.global_step % 100 == 0:
+                # Memory cleanup (configurable interval, default 1000)
+                gc_interval = self.config.get("training", {}).get("gc_interval", 1000)
+                if self.global_step % gc_interval == 0:
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         # Final checkpoint
         self.save_checkpoint(os.path.join(save_dir, "checkpoint_final.pth"))
