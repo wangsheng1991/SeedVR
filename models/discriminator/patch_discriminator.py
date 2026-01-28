@@ -108,28 +108,18 @@ class PatchDiscriminator3D(nn.Module):
         self._build_feature_layers(in_channels, base_channels, num_layers, use_spectral_norm)
 
     def _build_feature_layers(self, in_channels, base_channels, num_layers, use_spectral_norm):
-        """Build separate layers for feature extraction"""
-        self.feature_layers = nn.ModuleList()
+        """Build layers for feature extraction (shares weights with self.model)"""
+        # We'll extract features by running through model layers directly
+        # Store layer indices for feature extraction
+        self.feature_layer_indices = []
 
-        # First layer
-        first_conv = nn.Conv3d(
-            in_channels, base_channels,
-            kernel_size=(1, 4, 4),
-            stride=(1, 2, 2),
-            padding=(0, 1, 1)
-        )
-        if use_spectral_norm:
-            first_conv = nn.utils.spectral_norm(first_conv)
-        self.feature_layers.append(nn.Sequential(first_conv, nn.LeakyReLU(0.2, inplace=True)))
+        # First layer is at index 0-1 (conv + relu)
+        self.feature_layer_indices.append(2)  # After first conv block
 
         # Intermediate layers
-        in_ch = base_channels
         for i in range(1, num_layers):
-            out_ch = min(base_channels * (2 ** i), 512)
-            self.feature_layers.append(
-                ConvBlock3D(in_ch, out_ch, use_spectral_norm=use_spectral_norm)
-            )
-            in_ch = out_ch
+            # Each ConvBlock3D adds one module
+            self.feature_layer_indices.append(2 + i)
 
     def forward(
         self,
@@ -149,15 +139,19 @@ class PatchDiscriminator3D(nn.Module):
             pred = self.model(x)
             return pred, None
 
-        # Extract features from each layer
+        # Extract features while running forward pass (single pass)
         features = []
         out = x
-        for layer in self.feature_layers:
-            out = layer(out)
-            features.append(out)
 
-        # Final prediction
-        pred = self.model(x)
+        # Run through model layers and collect features
+        for i, layer in enumerate(self.model):
+            out = layer(out)
+            # Collect features after specific layers (before final conv)
+            if i in self.feature_layer_indices:
+                features.append(out)
+
+        # out is now the final prediction
+        pred = out
 
         return pred, features
 

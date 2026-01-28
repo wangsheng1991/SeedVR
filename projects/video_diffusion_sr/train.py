@@ -47,26 +47,31 @@ from data.video_pair_dataset import create_dataloader
 
 class EMAModel:
     """Exponential Moving Average for model parameters"""
-    def __init__(self, model: nn.Module, decay: float = 0.9999):
+    def __init__(self, model: nn.Module, decay: float = 0.9999, device: torch.device = None):
         self.decay = decay
+        self.device = device
         self.shadow = {}
         self.backup = {}
 
         for name, param in model.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+                # Clone to the same device as the parameter
+                self.shadow[name] = param.data.clone().to(device if device else param.device)
 
     @torch.no_grad()
     def update(self, model: nn.Module):
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
+                # Ensure shadow is on the same device
+                if self.shadow[name].device != param.device:
+                    self.shadow[name] = self.shadow[name].to(param.device)
                 self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.data
 
     def apply_shadow(self, model: nn.Module):
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 self.backup[name] = param.data.clone()
-                param.data = self.shadow[name]
+                param.data = self.shadow[name].to(param.device)
 
     def restore(self, model: nn.Module):
         for name, param in model.named_parameters():
@@ -75,10 +80,11 @@ class EMAModel:
         self.backup = {}
 
     def state_dict(self):
-        return self.shadow
+        return {k: v.cpu() for k, v in self.shadow.items()}
 
-    def load_state_dict(self, state_dict):
-        self.shadow = state_dict
+    def load_state_dict(self, state_dict, device=None):
+        for k, v in state_dict.items():
+            self.shadow[k] = v.to(device) if device else v
 
 
 class VideoDiffusionTrainer:
@@ -186,7 +192,7 @@ class VideoDiffusionTrainer:
         """Initialize EMA for generator"""
         if self.config.get("ema", {}).get("decay", 0) > 0:
             decay = self.config.ema.decay
-            self.ema = EMAModel(self.dit, decay=decay)
+            self.ema = EMAModel(self.dit, decay=decay, device=self.device)
             self.logger.info(f"Initialized EMA with decay={decay}")
 
     def configure_optimizers(self):
@@ -255,8 +261,18 @@ class VideoDiffusionTrainer:
     def configure_amp(self):
         """Configure automatic mixed precision"""
         if self.config.get("training", {}).get("use_amp", True):
-            self.scaler = GradScaler()
-            self.logger.info("Enabled automatic mixed precision (AMP)")
+            # Use separate scalers for G and D to avoid interference
+            self.scaler_g = GradScaler()
+            self.scaler_d = GradScaler()
+            self.logger.info("Enabled automatic mixed precision (AMP) with separate scalers")
+        else:
+            self.scaler_g = None
+            self.scaler_d = None
+
+        # Gradient clipping config
+        self.gradient_clip = self.config.get("training", {}).get("gradient_clip", 0.0)
+        if self.gradient_clip > 0:
+            self.logger.info(f"Gradient clipping enabled: max_norm={self.gradient_clip}")
 
     def configure_all(
         self,
@@ -364,7 +380,7 @@ class VideoDiffusionTrainer:
         timestep = torch.zeros(batch_size, device=self.device)
 
         # DiT forward
-        with autocast("cuda", torch.bfloat16, enabled=self.scaler is not None):
+        with autocast("cuda", torch.bfloat16, enabled=self.scaler_g is not None):
             output = self.dit(
                 vid=dit_input,
                 txt=text_embeds.get("texts_pos", []),
@@ -398,26 +414,42 @@ class VideoDiffusionTrainer:
         if apply_r1:
             hq_video = hq_video.detach().requires_grad_(True)
 
-        # Forward pass
-        with autocast("cuda", torch.bfloat16, enabled=self.scaler is not None):
+        # Forward pass with AMP
+        with autocast("cuda", torch.bfloat16, enabled=self.scaler_d is not None):
             real_pred, real_features = self.discriminator(hq_video, return_features=True)
             fake_pred, _ = self.discriminator(fake_video.detach(), return_features=False)
 
-            # Compute discriminator loss
-            d_loss, d_loss_dict = self.loss_fn.compute_discriminator_loss(
-                real_pred=real_pred,
-                fake_pred=fake_pred,
-                real_images=hq_video if apply_r1 else None,
-                apply_r1=apply_r1,
-            )
+            # Compute discriminator adversarial loss
+            if self.loss_fn.loss_type == 'nonsaturating':
+                d_adv = self.loss_fn.apt_loss.discriminator_loss(real_pred, fake_pred)
+            else:
+                d_adv = self.loss_fn.apt_loss.hinge_discriminator_loss(real_pred, fake_pred)
 
-        # Backward
-        if self.scaler is not None:
-            self.scaler.scale(d_loss).backward()
-            self.scaler.step(self.optimizer_d)
-            self.scaler.update()
+        d_loss_dict = {'d_adv': d_adv.item()}
+        total_loss = d_adv
+
+        # R1 regularization - compute outside autocast for numerical stability
+        if apply_r1 and hq_video is not None:
+            # Need to exit autocast for gradient computation
+            real_pred_float = real_pred.float()
+            d_r1 = self.loss_fn.apt_loss.r1_regularization(real_pred_float, hq_video)
+            d_loss_dict['d_r1'] = d_r1.item()
+            total_loss = total_loss + d_r1
+
+        d_loss_dict['d_total'] = total_loss.item()
+
+        # Backward with gradient clipping
+        if self.scaler_d is not None:
+            self.scaler_d.scale(total_loss).backward()
+            if self.gradient_clip > 0:
+                self.scaler_d.unscale_(self.optimizer_d)
+                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.gradient_clip)
+            self.scaler_d.step(self.optimizer_d)
+            self.scaler_d.update()
         else:
-            d_loss.backward()
+            total_loss.backward()
+            if self.gradient_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.gradient_clip)
             self.optimizer_d.step()
 
         return d_loss_dict
@@ -443,14 +475,14 @@ class VideoDiffusionTrainer:
         self.optimizer_g.zero_grad()
 
         # Generate fake
-        with autocast("cuda", torch.bfloat16, enabled=self.scaler is not None):
+        with autocast("cuda", torch.bfloat16, enabled=self.scaler_g is not None):
             fake_latent = self.generator_forward(lq_latent, text_embeds)
 
         # Decode to pixel space
         fake_video = self.vae_decode(fake_latent)
 
         # Discriminator forward (for generator loss)
-        with autocast("cuda", torch.bfloat16, enabled=self.scaler is not None):
+        with autocast("cuda", torch.bfloat16, enabled=self.scaler_g is not None):
             # Get real features (no grad needed, just for matching)
             with torch.no_grad():
                 _, real_features = self.discriminator(hq_video, return_features=True)
@@ -467,13 +499,18 @@ class VideoDiffusionTrainer:
                 real_images=hq_video,
             )
 
-        # Backward
-        if self.scaler is not None:
-            self.scaler.scale(g_loss).backward()
-            self.scaler.step(self.optimizer_g)
-            self.scaler.update()
+        # Backward with gradient clipping
+        if self.scaler_g is not None:
+            self.scaler_g.scale(g_loss).backward()
+            if self.gradient_clip > 0:
+                self.scaler_g.unscale_(self.optimizer_g)
+                torch.nn.utils.clip_grad_norm_(self.dit.parameters(), self.gradient_clip)
+            self.scaler_g.step(self.optimizer_g)
+            self.scaler_g.update()
         else:
             g_loss.backward()
+            if self.gradient_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.dit.parameters(), self.gradient_clip)
             self.optimizer_g.step()
 
         return fake_video, g_loss_dict
@@ -485,6 +522,9 @@ class VideoDiffusionTrainer:
     ) -> Dict[str, float]:
         """
         Complete training step (D + G)
+
+        Standard GAN training order: D first, then G
+        This ensures D sees the latest fake samples before G updates
 
         Args:
             batch: Data batch with 'lq' and 'hq' keys
@@ -508,18 +548,24 @@ class VideoDiffusionTrainer:
         r1_interval = self.config.get("loss", {}).get("r1_interval", 16)
         apply_r1 = (self.global_step % r1_interval == 0)
 
-        # Train generator
+        # ============ Step 1: Train Discriminator First ============
+        # Generate fake video (no grad for D step)
+        with torch.no_grad():
+            with autocast("cuda", torch.bfloat16, enabled=self.scaler_g is not None):
+                fake_latent = self.generator_forward(lq_latent, text_embeds)
+            fake_video_for_d = self.vae_decode(fake_latent)
+
+        d_loss_dict = self.train_step_discriminator(
+            hq_video=hq_video,
+            fake_video=fake_video_for_d,
+            apply_r1=apply_r1,
+        )
+
+        # ============ Step 2: Train Generator ============
         fake_video, g_loss_dict = self.train_step_generator(
             lq_latent=lq_latent,
             hq_video=hq_video,
             text_embeds=text_embeds,
-        )
-
-        # Train discriminator
-        d_loss_dict = self.train_step_discriminator(
-            hq_video=hq_video,
-            fake_video=fake_video,
-            apply_r1=apply_r1,
         )
 
         # Update EMA

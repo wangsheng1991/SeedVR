@@ -100,24 +100,42 @@ class VideoPairDataset(Dataset):
         video, _, info = read_video(path, output_format="TCHW")
         return video.float() / 255.0
 
-    def _sample_frames(self, video: torch.Tensor) -> torch.Tensor:
-        """Sample frames from video"""
+    def _sample_frames(self, video: torch.Tensor, start_idx: int = None, indices: list = None) -> Tuple[torch.Tensor, int, list]:
+        """
+        Sample frames from video
+
+        Args:
+            video: Input video tensor (T, C, H, W)
+            start_idx: Optional fixed start index (for syncing LQ/HQ)
+            indices: Optional fixed indices (for syncing LQ/HQ)
+
+        Returns:
+            sampled_video: Sampled frames
+            start_idx: The start index used
+            indices: The indices used
+        """
         total_frames = video.shape[0]
         required_frames = self.num_frames * self.frame_interval
 
         if total_frames < required_frames:
-            # Pad by repeating last frame
+            # Pad by temporal reflection (more natural than repeating last frame)
             padding = required_frames - total_frames
-            video = torch.cat([video, video[-1:].repeat(padding, 1, 1, 1)], dim=0)
-            start_idx = 0
+            # Reflect padding: [..., n-2, n-1, n-1, n-2, ...]
+            pad_frames = video.flip(dims=[0])[:padding]
+            video = torch.cat([video, pad_frames], dim=0)
+            if start_idx is None:
+                start_idx = 0
         else:
-            # Random start position
-            max_start = total_frames - required_frames
-            start_idx = random.randint(0, max_start)
+            if start_idx is None:
+                # Random start position
+                max_start = total_frames - required_frames
+                start_idx = random.randint(0, max_start)
 
         # Sample frames with interval
-        indices = list(range(start_idx, start_idx + required_frames, self.frame_interval))
-        return video[indices]
+        if indices is None:
+            indices = list(range(start_idx, start_idx + required_frames, self.frame_interval))
+
+        return video[indices], start_idx, indices
 
     def _random_crop(
         self,
@@ -210,10 +228,10 @@ class VideoPairDataset(Dataset):
             lq_path = os.path.join(self.lq_dir, video_name)
             lq = self._load_video(lq_path)
 
-        # Sample frames
-        hq = self._sample_frames(hq)
+        # Sample frames (use same indices for HQ and LQ to ensure sync)
+        hq, start_idx, indices = self._sample_frames(hq)
         if lq is not None:
-            lq = self._sample_frames(lq)
+            lq, _, _ = self._sample_frames(lq, start_idx=start_idx, indices=indices)
 
         # Random crop
         hq, lq = self._random_crop(hq, lq)
